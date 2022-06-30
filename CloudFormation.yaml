@@ -1,0 +1,609 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# The references taking under consideration for creating this CloudFormation template are mentioned below.
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-resource-lex-bot.html
+# https://jennapederson.com/blog/2021/6/21/provisioning-an-ec2-instance-with-cloudformation-part-1/
+# https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-sns-topic.html
+# https://bl.ocks.org/magnetikonline/c314952045eee8e8375b82bc7ec68e88
+
+Parameters:
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+
+  EnvironmentType:
+    Type: String
+    Default: prod
+
+  AmiID:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+  InstanceType:
+    Type: String
+    Description: CloudCritics EC2 Instance
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 Key Pair (.PEM File)
+
+  MoviesLambda:
+    Type: String
+    Default: MoviesLambda
+
+  subscribeNewsletter:
+    Type: String
+    Default: subscribeNewsletter
+
+  MovieReviewsDatabase:
+    Type: String
+    Default: MovieReviewsDatabase
+
+  movieapi:
+    Type: String
+    Default: movieapi
+
+  newsletter:
+    Type: String
+    Default: newsletter
+
+  EnvironmentName:
+    Type: String
+    Default: Prod
+
+  apiGatewayName:
+    Type: String
+    Default: movieapi
+
+  apiGatewayStageName:
+    Type: String
+    AllowedPattern: "[a-z0-9]+"
+    Default: call
+
+  apiGatewayHTTPMethod:
+    Type: String
+    Default: POST
+
+  lambdaFunctionName:
+    Type: String
+    AllowedPattern: "[a-zA-Z0-9]+[a-zA-Z0-9-]+[a-zA-Z0-9]+"
+    Default: MoviesLambda
+
+  lambdaFunctionNameNL:
+    Type: String
+    AllowedPattern: "[a-zA-Z0-9]+[a-zA-Z0-9-]+[a-zA-Z0-9]+"
+    Default: subscribeNewsletter
+
+  SubscribeAPI:
+    Type: String
+    Default: SubscribeAPI
+
+  SubscribeLambda:
+    Type: String
+    Default: SubscribeLambda
+
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+
+  AmiID:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+  InstanceType:
+    Type: String
+    Description: CloudCritics EC2 Instance
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+
+  CloudCriticsSNSTopic:
+    Type: String
+    Description: CloudCritics Newsletter SNS Topic
+    Default: CloudCriticsNewsletter
+
+
+Resources:
+  CloudCriticsAppInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZone
+      ImageId: !Ref AmiID
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      SecurityGroupIds:
+        - !Ref CloudCriticsSecurityGroup
+
+  CloudCriticsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: CloudCriticsSecurityGroup
+      GroupDescription: "Allow incoming outgoing HTTP, HTTPS and SSH traffic"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+
+  CloudCriticsAppEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref CloudCriticsAppInstance
+  
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: UserDetailsPool
+      UsernameAttributes: 
+          - email
+      UsernameConfiguration:
+          CaseSensitive: False
+      Schema:
+          - AttributeDataType: String
+            DeveloperOnlyAttribute: False
+            Mutable: True
+            Name: name
+            Required: True  
+          - AttributeDataType: String
+            DeveloperOnlyAttribute: False
+            Mutable: True
+            Name: email
+            Required: True
+      AdminCreateUserConfig: 
+          AllowAdminCreateUserOnly: False
+      MfaConfiguration: "OFF"
+      AccountRecoverySetting:
+          RecoveryMechanisms:
+              - Name: verified_email
+                Priority: 1
+      AutoVerifiedAttributes: 
+          - email
+      VerificationMessageTemplate:
+          DefaultEmailOption: CONFIRM_WITH_LINK
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+        ClientName: CloudCritics
+        UserPoolId:
+            Ref: UserPool
+        ExplicitAuthFlows:
+            - ALLOW_USER_SRP_AUTH
+            - ALLOW_REFRESH_TOKEN_AUTH
+
+  UserPoolDetails:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties: 
+        Domain: cloudcriticswebapp28
+        UserPoolId:
+            Ref: UserPool
+
+  LambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile: |
+            const AWS = require('aws-sdk');
+            const comprehend = new AWS.Comprehend({ region: 'us-east-1'})
+            const documentClient = new AWS.DynamoDB.DocumentClient();
+            exports.addMovie = async (event) => {
+                console.log(" Re : " + event);
+                console.log("Reviews : " + JSON.stringify(event.reviews)); 
+                var reviewsOP = [];
+                event.reviews.forEach(element => reviewsOP.push(element.content));
+                const textReview = "Good morning, this is the first SA.";
+                console.log("Hello: " + reviewsOP);
+                const resultSA = await comprehend.batchDetectSentiment({ LanguageCode: "en", TextList: reviewsOP, })
+                .promise();
+                console.log(resultSA.Sentiment);
+                var params = { 
+                    Item: {
+                        "Id": event.id,
+                        "Movie": event.name,
+                        "Sentiment": resultSA.Sentiment,
+                        },
+                        TableName: "MovieReviewsDatabase",
+                    }
+                await documentClient.put(params, function (err, data) {
+                    if (err) {
+                        console.log('Error', err)
+                    } else {
+                        console.log('Success', data)
+                    }
+                }).promise();
+                let response = {
+                    statusCode: 200,
+                    body: JSON.stringify(resultSA)
+                };
+                return response;
+            }
+      FunctionName:
+        Ref: MoviesLambda
+      Handler: index.addMovie
+      Runtime: nodejs12.x
+      Role: !GetAtt IAMRole.Arn
+    DependsOn:
+      - DynamoDBTable
+  lambdaApiGatewayInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+        Action: lambda:InvokeFunction
+        FunctionName: !GetAtt LambdaFunction.Arn
+        Principal: "apigateway.amazonaws.com"
+        SourceArn: !Sub arn:aws:execute-api:us-east-1:719095732716:${APIGatewayRestAPI}/*/POST/addmovie
+
+  IAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: Policy_api-lambda-db
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:BatchGetItem'
+                  - 'dynamodb:BatchWriteItem'
+                  - 'dynamodb:TagResource'
+                  - 'dynamodb:UntagResource'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:DeleteItem'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:Scan'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:UpdateItem'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:CreateLogGroup'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+
+  DynamoDBTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName:
+        Ref: MovieReviewsDatabase
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: '5'
+        WriteCapacityUnits: '5'
+    DependsOn:
+      - IAMRole
+
+  APIGatewayRestAPI:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name:
+        Ref: movieapi
+    DependsOn:
+      - LambdaFunction
+  APIGatewayResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ParentId: !GetAtt
+        - APIGatewayRestAPI
+        - RootResourceId
+      PathPart: addmovie
+    DependsOn:
+      - APIGatewayRestAPI
+  APIGatewayMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref APIGatewayResource
+      HttpMethod: OPTIONS
+      Integration:
+        IntegrationResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: '''Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'''
+            method.response.header.Access-Control-Allow-Methods: '''POST,OPTIONS'''
+            method.response.header.Access-Control-Allow-Origin: '''*'''
+          ResponseTemplates:
+            application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+      HttpMethod: POST
+      AuthorizationType: NONE
+      MethodResponses:
+        - StatusCode: 200
+        - StatusCode: 404
+      Integration:
+        Type: AWS
+        IntegrationResponses:
+          - StatusCode: 200
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - >-
+            arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFuncNameArn}/invocations
+          - LambdaFuncNameArn: !GetAtt LambdaFunction.Arn
+    DependsOn:
+      - APIGatewayResource
+  APIGatewayDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      StageName:
+        Ref: EnvironmentName
+    DependsOn:
+      - APIGatewayMethod
+  APIGatewayPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - APIGatewayDeployment
+
+  LambdaFunctionSNS:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          def handler(event, context):
+            email = event['email']
+            access_key_id = "AKIAYF655U5VOYT6TIER"
+            secret_access_key = "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"
+            sns = boto3.client('sns', region_name = "us-east-1", aws_access_key_id = access_key_id, aws_secret_access_key = secret_access_key)
+            topic_arn = "arn:aws:sns:us-east-1:562569258858:CloudCriticsTopic"
+            resp_email = sns.subscribe(TopicArn = topic_arn, Protocol = "EMAIL", Endpoint = email)
+            return resp_email
+      FunctionName:
+        Ref: SubscribeLambda
+      Handler: "index.handler"
+      Runtime: python3.9
+      Role: !GetAtt IAMRoleSNS.Arn
+  lambdaApiGatewayInvokeNL:
+    Type: AWS::Lambda::Permission
+    Properties:
+        Action: lambda:InvokeFunction
+        FunctionName: !GetAtt LambdaFunctionSNS.Arn
+        Principal: "apigateway.amazonaws.com"
+        SourceArn: !Sub arn:aws:execute-api:us-east-1:719095732716:${APIGatewayRestAPISNS}/*/POST/subscribe
+
+  APIGatewayRestAPISNS:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name:
+        Ref: SubscribeAPI
+    DependsOn:
+      - LambdaFunctionSNS
+  APIGatewayResourceSNS:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt
+        - APIGatewayRestAPISNS
+        - RootResourceId
+      PathPart:
+        Ref: SubscribeLambda
+      RestApiId: !Ref APIGatewayRestAPISNS
+    DependsOn:
+      - APIGatewayRestAPISNS
+  APIGatewayMethodSNS:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      Integration:
+        IntegrationHttpMethod: POST
+        IntegrationResponses:
+          - StatusCode: 200
+        Type: AWS
+        Uri: !Sub
+          - "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations"
+          - lambdaArn: !GetAtt LambdaFunctionSNS.Arn
+      MethodResponses:
+        - StatusCode: 200
+      ResourceId: !Ref APIGatewayResourceSNS
+      RestApiId: !Ref APIGatewayRestAPISNS
+    DependsOn:
+      - APIGatewayResourceSNS
+  APIGatewayDeploymentSNS:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPISNS
+      StageName: !Ref EnvironmentName
+    DependsOn:
+      - APIGatewayMethodSNS
+  APIGatewayPermissionSNSSNS:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LambdaFunctionSNS.Arn
+      Principal: apigateway.amazonaws.com
+    DependsOn:
+      - APIGatewayDeploymentSNS
+
+  IAMRoleSNS:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+      Policies:
+        - PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action: ["cloudwatch:*", "logs:*"]
+                Effect: Allow
+                Resource: "*"
+          PolicyName: "lambdaLogPolicy"
+
+  CloudCriticsChatBot:
+    DependsOn: IAMRoleNL
+    Type: AWS::Lex::Bot
+    Properties:
+      Name: CriticBot
+      RoleArn: !GetAtt IAMRoleNL.Arn
+      DataPrivacy:
+        ChildDirected: false
+      IdleSessionTTLInSeconds: 300
+      Description: This is a Cloud Critics Chat Bot
+      AutoBuildBotLocales: false
+      BotLocales:
+        - LocaleId: en_US
+          Description: "Cloud Critics Information Locale"
+          NluConfidenceThreshold: 0.40
+          VoiceSettings:
+            VoiceId: "Ivy"
+          Intents:
+            - Name: CloudCriticsInfo
+              Description: Intent to provide information about CloudCritics to user
+              SampleUtterances:
+                - Utterance: cloud critics
+                - Utterance: what is cloud critics
+                - Utterance: what is this website about
+              IntentConfirmationSetting:
+                PromptSpecification:
+                  MessageGroupsList:
+                    - Message:
+                        PlainTextMessage:
+                          Value: "CloudCritics website allows you to search movies and to perform sentiment analysis on the movie of your choice and it then displays results of sentiment analysis on the movie review."
+                  MaxRetries: 3
+                  AllowInterrupt: false
+                DeclinationResponse:
+                  MessageGroupsList:
+                    - Message:
+                        PlainTextMessage:
+                          Value: "Sorry cannot understand"
+                  AllowInterrupt: false
+            - Name: CloudCriticsContact
+              Description: Intent to provide information about how to contact CloudCritics
+              SampleUtterances:
+                - Utterance: inquires
+                - Utterance: contact
+                - Utterance: how can I send inquiries
+                - Utterance: how can I contact
+              IntentConfirmationSetting:
+                PromptSpecification:
+                  MessageGroupsList:
+                    - Message:
+                        PlainTextMessage:
+                          Value: "You can contact us by filling Contact Us form in the Contact section..."
+                  MaxRetries: 3
+                  AllowInterrupt: false
+                DeclinationResponse:
+                  MessageGroupsList:
+                    - Message:
+                        PlainTextMessage:
+                          Value: "Sorry cannot understand"
+                  AllowInterrupt: false
+            - Name: CloudCriticsUser
+              Description: Intent to provide information about how to join CloudCritics
+              SampleUtterances:
+                - Utterance: join
+                - Utterance: register
+                - Utterance: how can I join cloud critics
+                - Utterance: how can I register
+                - Utterance: how can I be part of cloud critics
+              IntentConfirmationSetting:
+                PromptSpecification:
+                  MessageGroupsList:
+                    - Message:
+                        PlainTextMessage:
+                          Value: "You can join us by registering yourself at the register page..."
+                  MaxRetries: 3
+                  AllowInterrupt: false
+                DeclinationResponse:
+                  MessageGroupsList:
+                    - Message:
+                        PlainTextMessage:
+                          Value: "Sorry cannot understand"
+                  AllowInterrupt: false
+            - Name: "FallbackIntent"
+              Description: "Default intent when no other intent matches"
+              ParentIntentSignature: "AMAZON.FallbackIntent"
+  CloudCriticsChatBotVersion:
+    DependsOn: CloudCriticsChatBot
+    Type: AWS::Lex::BotVersion
+    Properties:
+      BotId: !Ref CloudCriticsChatBot
+      BotVersionLocaleSpecification:
+        - LocaleId: en_US
+          BotVersionLocaleDetails:
+            SourceBotVersion: DRAFT
+      Description: CloudCritics Chat Bot Test Version
+  CloudCriticsChatBotAlias:
+    DependsOn: CloudCriticsChatBotVersion
+    Type: AWS::Lex::BotAlias
+    Properties:
+      BotId: !Ref CloudCriticsChatBot
+      BotAliasName: CloudCriticsChatBotV2Alias
+      BotVersion: !GetAtt CloudCriticsChatBotVersion.BotVersion
+      SentimentAnalysisSettings:
+        DetectSentiment: true
+
+  IAMRoleNL:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lexv2.amazonaws.com
+      Policies:
+        - PolicyName: LexRuntimeRolePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: ["cloudwatch:*", "logs:*"]
+                Resource: "*"
+
+  CloudCriticsNewsletter:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Cloud Critics Newsletter Subscription
+      TopicName: !Ref CloudCriticsSNSTopic
+  
